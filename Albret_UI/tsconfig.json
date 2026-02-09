@@ -5,8 +5,8 @@
             "esnext"
         ],
         "jsx": "react-native",
-        "module": "commonjs",
-        "moduleResolution": "node",
+        "module": "es2015",
+        "moduleResolution": "bundler",
         "allowSyntheticDefaultImports": true,
         "esModuleInterop": true,
         "skipLibCheck": true,

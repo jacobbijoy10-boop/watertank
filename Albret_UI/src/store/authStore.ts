@@ -124,14 +124,26 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
     checkSession: async () => {
         try {
-            const { data: { session } } = await supabase.auth.getSession();
+            const { data: { session }, error } = await supabase.auth.getSession();
+
+            if (error) {
+                console.warn('Session check failed:', error.message);
+                set({ isLoading: false, isAuthenticated: false });
+                return;
+            }
 
             if (session?.user) {
-                const { data: profile } = await supabase
+                const { data: profile, error: profileError } = await supabase
                     .from('users')
                     .select('*')
                     .eq('id', session.user.id)
                     .single();
+
+                if (profileError) {
+                    console.warn('Profile fetch failed:', profileError.message);
+                    set({ isLoading: false, isAuthenticated: false });
+                    return;
+                }
 
                 set({
                     user: profile,
@@ -147,9 +159,15 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
                     isLoading: false,
                 });
             }
-        } catch (error) {
-            console.error('Session check error:', error);
-            set({ isLoading: false });
+        } catch (error: any) {
+            // Network or connection errors - fail gracefully
+            console.warn('Network error during session check:', error?.message || 'Unknown error');
+            set({
+                isLoading: false,
+                isAuthenticated: false,
+                user: null,
+                session: null,
+            });
         }
     },
 

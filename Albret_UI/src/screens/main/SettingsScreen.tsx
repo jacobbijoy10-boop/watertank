@@ -1,12 +1,10 @@
 import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';
-import { useAuthStore } from '@/store/authStore';
 import { colors } from '@/theme/colors';
 import { typography } from '@/theme/typography';
 import { spacing } from '@/theme/spacing';
 
 export default function SettingsScreen({ navigation }: any) {
-    const user = useAuthStore(state => state.user);
 
     const settingsSections = [
         {
@@ -47,7 +45,7 @@ export default function SettingsScreen({ navigation }: any) {
                         <TouchableOpacity
                             key={itemIndex}
                             style={styles.settingItem}
-                            onPress={item.onPress || (() => { })}
+                            onPress={item.onPress || (() => item.screen && navigation.navigate(item.screen))}
                         >
                             <Text style={styles.settingLabel}>{item.label}</Text>
                             <Text style={styles.chevron}>›</Text>

@@ -1,90 +1,161 @@
 /*
- * Water Tank Monitor - ESP32 WROOM 32 Firmware
+ * Water Tank Monitor - ESP32 WROOM 32 with Auto-Cleaning
  * 
- * Hardware:
- * - ESP32 WROOM 32
- * - pH Sensor
- * - TDS Sensor
- * - Turbidity Sensor
- * - HC-SR04 Ultrasonic Sensor
- * - 2x Solenoid Valves
- * - DC Motor
- * - UV Light
- * - 4x Tactile Buttons
+ * Features:
+ * - Real-time sensor monitoring (pH, TDS, Turbidity, Water Level)
+ * - 16x2 LCD display for local monitoring
+ * - Automated cleaning sequence with motor stirring
+ * - Wi-Fi connectivity with Supabase integration
+ * - Manual and automatic cleaning triggers
+ * - UV light sanitation
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include "config.h"
 
+// LCD Setup
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ADC Constants
+const float ADC_MAX = 4095.0;
+const float VREF = 3.3;
+
 // Sensor Pins
-#define PH_PIN 34
-#define TDS_PIN 35
-#define TURBIDITY_PIN 32
-#define ULTRASONIC_TRIG 5
-#define ULTRASONIC_ECHO 18
-#define TEMP_PIN 33
+const int pHPin = 35;
+const int turbidityPin = 34;
+const int tdsPin = 32;
+const int tempPin = 33;
+const int trigPin = 4;
+const int echoPin = 2;
 
-// Actuator Pins
-#define VALVE_1_PIN 25
-#define VALVE_2_PIN 26
-#define MOTOR_PIN 27
-#define UV_LIGHT_PIN 14
+// pH Calibration
+float pH_Slope  = -4.16;
+float pH_Offset = 17.27;
 
-// Button Pins
-#define BUTTON_1_PIN 12
-#define BUTTON_2_PIN 13
-#define BUTTON_3_PIN 15
-#define BUTTON_4_PIN 4
+// Turbidity Calibration
+#define V_CLEAR   1.52
+#define V_DIRTY   0.80
+#define NTU_CLEAR 1.0
+#define NTU_DIRTY 100.0
+float turbSlope;
+float turbOffset;
 
-// Constants
-#define TANK_HEIGHT_CM 100 // Tank height in cm
-#define SENSOR_READ_INTERVAL 2000 // 2 seconds
+// TDS Calibration
+float tdsFactor = 0.5;
+
+// Ultrasonic Setup
+#define SENSOR_OFFSET_CM  5.0
+#define TANK_HEIGHT_CM    50.0
+#define DEAD_ZONE_CM      5.0
+
+// Thresholds
+#define PH_LOW_LIMIT        6.5
+#define PH_HIGH_LIMIT       8.5
+#define TURBIDITY_LIMIT     25.0
+#define TDS_LIMIT           500.0
+#define LEVEL_LIMIT_PERCENT 5.0
+#define TEMP_LIMIT          35.0
+
+// Motor Driver Pins (BTS7960)
+#define RPWM 25  // Right PWM (Forward)
+#define LPWM 26  // Left PWM (Backward)
+#define REN  33  // Right Enable
+#define LEN  15  // Left Enable
+
+// Relay Pins
+#define RELAY_PUMP        27
+#define RELAY_INLET_VALVE 18
+#define RELAY_DRAIN_VALVE 19
+#define RELAY_UV_LIGHT    14
+
+// Button Pin
+#define CLEAN_BUTTON 16
+
+// Timing
+#define SENSOR_READ_INTERVAL 2000   // 2 seconds
+#define SUPABASE_UPDATE_INTERVAL 5000 // 5 seconds
 #define COMMAND_CHECK_INTERVAL 3000 // 3 seconds
-#define DEBOUNCE_DELAY 50
 
-// Global variables
+// Global State
+bool userApproved = false;
+bool cleaningInProgress = false;
 unsigned long lastSensorRead = 0;
+unsigned long lastSupabaseUpdate = 0;
 unsigned long lastCommandCheck = 0;
-bool valve1State = false;
-bool valve2State = false;
-bool uvLightState = false;
-int motorSpeed = 0;
 
-// Button states
-bool lastButton1State = HIGH;
-bool lastButton2State = HIGH;
-bool lastButton3State = HIGH;
-bool lastButton4State = HIGH;
-unsigned long lastDebounceTime = 0;
+// Sensor Data
+float currentPH = 0;
+float currentTurbidity = 0;
+float currentTDS = 0;
+float currentTemp = 0;
+float currentLevel = 0;
+
+// Forward declarations
+void connectWiFi();
+void readSensors();
+void updateLCD();
+void checkCleaningNeeded();
+void startCleaning();
+void sendDataToSupabase();
+void checkSupabaseCommands();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Water Tank Monitor Starting...");
+  Serial.println("AquaPro Water Tank Monitor Starting...");
+
+  // Initialize LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("AquaPro v2.0");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+
+  // Initialize Relay Pins (Active LOW)
+  pinMode(RELAY_PUMP, OUTPUT);
+  pinMode(RELAY_INLET_VALVE, OUTPUT);
+  pinMode(RELAY_DRAIN_VALVE, OUTPUT);
+  pinMode(RELAY_UV_LIGHT, OUTPUT);
   
-  // Initialize pins
-  pinMode(VALVE_1_PIN, OUTPUT);
-  pinMode(VALVE_2_PIN, OUTPUT);
-  pinMode(MOTOR_PIN, OUTPUT);
-  pinMode(UV_LIGHT_PIN, OUTPUT);
+  digitalWrite(RELAY_PUMP, HIGH);
+  digitalWrite(RELAY_INLET_VALVE, HIGH);
+  digitalWrite(RELAY_DRAIN_VALVE, HIGH);
+  digitalWrite(RELAY_UV_LIGHT, LOW);
+
+  // Initialize Motor Driver
+  pinMode(RPWM, OUTPUT);
+  pinMode(LPWM, OUTPUT);
+  pinMode(REN, OUTPUT);
+  pinMode(LEN, OUTPUT);
   
-  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_3_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_4_PIN, INPUT_PULLUP);
-  
-  pinMode(ULTRASONIC_TRIG, OUTPUT);
-  pinMode(ULTRASONIC_ECHO, INPUT);
-  
-  // Initialize actuators to OFF
-  digitalWrite(VALVE_1_PIN, LOW);
-  digitalWrite(VALVE_2_PIN, LOW);
-  digitalWrite(MOTOR_PIN, LOW);
-  digitalWrite(UV_LIGHT_PIN, LOW);
-  
+  digitalWrite(REN, LOW);
+  digitalWrite(LEN, LOW);
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, 0);
+
+  // Initialize Ultrasonic
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // Initialize Button
+  pinMode(CLEAN_BUTTON, INPUT_PULLUP);
+
+  // Calculate turbidity calibration
+  turbSlope  = (NTU_DIRTY - NTU_CLEAR) / (V_DIRTY - V_CLEAR);
+  turbOffset = NTU_CLEAR - (turbSlope * V_CLEAR);
+
   // Connect to WiFi
   connectWiFi();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  delay(2000);
 }
 
 void loop() {
@@ -92,264 +163,398 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
-  
-  // Read sensors and send data
+
+  // Read sensors periodically
   if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
-    readAndSendSensorData();
+    readSensors();
+    checkCleaningNeeded();
     lastSensorRead = millis();
   }
-  
-  // Check for commands from app
+
+  // Update Supabase periodically
+  if (millis() - lastSupabaseUpdate >= SUPABASE_UPDATE_INTERVAL) {
+    sendDataToSupabase();
+    lastSupabaseUpdate = millis();
+  }
+
+  // Check for Supabase commands
   if (millis() - lastCommandCheck >= COMMAND_CHECK_INTERVAL) {
-    checkForCommands();
+    checkSupabaseCommands();
     lastCommandCheck = millis();
   }
-  
-  // Handle button presses
-  handleButtons();
+
+  // Check for manual clean button press
+  if (!cleaningInProgress && digitalRead(CLEAN_BUTTON) == LOW) {
+    userApproved = true;
+    delay(200); // Debounce
+  }
+
+  // Check for serial commands
+  if (!cleaningInProgress && Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "CLEAN") {
+      userApproved = true;
+    }
+  }
+
+  // Update LCD display
+  if (!cleaningInProgress) {
+    updateLCD();
+  }
+
+  delay(100);
 }
 
 void connectWiFi() {
-  Serial.print("Connecting to WiFi");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
+    lcd.setCursor(attempts % 16, 1);
+    lcd.print(".");
     attempts++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi Connected!");
-    Serial.print("IP: ");
+    Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    delay(2000);
   } else {
     Serial.println("\nWiFi Connection Failed!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Config");
+    delay(3000);
   }
 }
 
-float readPH() {
-  int analogValue = analogRead(PH_PIN);
-  float voltage = analogValue * (3.3 / 4095.0);
-  // pH calculation: pH = 7 + ((2.5 - voltage) / 0.18)
-  float ph = 7.0 + ((2.5 - voltage) / 0.18);
-  return constrain(ph, 0, 14);
-}
+void readSensors() {
+  // Read pH
+  currentPH = (analogRead(pHPin) / ADC_MAX * VREF) * pH_Slope + pH_Offset;
 
-int readTDS() {
-  int analogValue = analogRead(TDS_PIN);
-  float voltage = analogValue * (3.3 / 4095.0);
-  // TDS = (133.42 * voltage^3 - 255.86 * voltage^2 + 857.39 * voltage) * 0.5
-  float tds = (133.42 * pow(voltage, 3) - 255.86 * pow(voltage, 2) + 857.39 * voltage) * 0.5;
-  return (int)constrain(tds, 0, 2000);
-}
+  // Read Turbidity
+  float vTurb = analogRead(turbidityPin) / ADC_MAX * VREF;
+  currentTurbidity = turbSlope * vTurb + turbOffset;
+  if (currentTurbidity < 0) currentTurbidity = 0;
 
-float readTurbidity() {
-  int analogValue = analogRead(TURBIDITY_PIN);
-  float voltage = analogValue * (3.3 / 4095.0);
-  // Turbidity in NTU (inverse relationship with voltage)
-  float turbidity = -1120.4 * pow(voltage, 2) + 5742.3 * voltage - 4352.9;
-  return constrain(turbidity, 0, 100);
-}
+  // Read TDS
+  float vTDS = analogRead(tdsPin) / ADC_MAX * VREF;
+  currentTDS = (133.42 * vTDS * vTDS * vTDS
+              - 255.86 * vTDS * vTDS
+              + 857.39 * vTDS) * tdsFactor;
+  if (currentTDS < 0) currentTDS = 0;
 
-float readTemperature() {
-  int analogValue = analogRead(TEMP_PIN);
-  float voltage = analogValue * (3.3 / 4095.0);
-  // Convert voltage to temperature (assuming LM35 or similar)
-  float temperature = (voltage - 0.5) * 100;
-  return temperature;
-}
+  // Read Temperature (assuming NTC or LM35)
+  float vTemp = analogRead(tempPin) / ADC_MAX * VREF;
+  currentTemp = vTemp * 100.0; // For LM35: 10mV/°C
 
-int readWaterLevel() {
-  digitalWrite(ULTRASONIC_TRIG, LOW);
+  // Read Water Level
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(ULTRASONIC_TRIG, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  
-  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
-  float distance = duration * 0.034 / 2; // Convert to cm
-  
-  // Convert distance to percentage (100% when full)
-  int percentage = (int)((TANK_HEIGHT_CM - distance) / TANK_HEIGHT_CM * 100);
-  return constrain(percentage, 0, 100);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  float dist = (duration * 0.0343) / 2.0;
+  if (dist < DEAD_ZONE_CM) dist = DEAD_ZONE_CM;
+
+  float waterHeight = TANK_HEIGHT_CM - (dist - SENSOR_OFFSET_CM);
+  if (waterHeight < 0) waterHeight = 0;
+  if (waterHeight > TANK_HEIGHT_CM) waterHeight = TANK_HEIGHT_CM;
+  currentLevel = (waterHeight / TANK_HEIGHT_CM) * 100.0;
+
+  // Print to Serial
+  Serial.print("pH: "); Serial.print(currentPH, 2);
+  Serial.print(" | Turb: "); Serial.print(currentTurbidity, 1);
+  Serial.print(" | TDS: "); Serial.print(currentTDS, 0);
+  Serial.print(" | Temp: "); Serial.print(currentTemp, 1);
+  Serial.print(" | Level: "); Serial.print(currentLevel, 1);
+  Serial.println("%");
 }
 
-void readAndSendSensorData() {
-  float ph = readPH();
-  int tds = readTDS();
-  float turbidity = readTurbidity();
-  float temperature = readTemperature();
-  int waterLevel = readWaterLevel();
+void updateLCD() {
+  static bool showParams = true;
+  static unsigned long lastToggle = 0;
   
-  Serial.println("=== Sensor Readings ===");
-  Serial.printf("pH: %.2f\n", ph);
-  Serial.printf("TDS: %d ppm\n", tds);
-  Serial.printf("Turbidity: %.2f NTU\n", turbidity);
-  Serial.printf("Temperature: %.1f°C\n", temperature);
-  Serial.printf("Water Level: %d%%\n", waterLevel);
+  if (millis() - lastToggle < 3000) return;
+  lastToggle = millis();
+
+  lcd.clear();
+  if (showParams) {
+    // Show sensor readings
+    lcd.setCursor(0, 0);
+    lcd.print("pH:");
+    lcd.print(currentPH, 1);
+    lcd.print(" T:");
+    lcd.print(currentTurbidity, 0);
+    
+    lcd.setCursor(0, 1);
+    lcd.print("TDS:");
+    lcd.print(currentTDS, 0);
+    lcd.print(" L:");
+    lcd.print(currentLevel, 0);
+    lcd.print("%");
+  } else {
+    // Show alert status
+    bool cleaningNeeded = (currentPH < PH_LOW_LIMIT || currentPH > PH_HIGH_LIMIT ||
+                          currentTurbidity > TURBIDITY_LIMIT ||
+                          currentTDS > TDS_LIMIT);
+    
+    lcd.setCursor(0, 0);
+    if (cleaningNeeded) {
+      lcd.print("*** ALERT ***");
+      lcd.setCursor(0, 1);
+      lcd.print("CLEANING NEEDED");
+    } else {
+      lcd.print("Water Quality");
+      lcd.setCursor(0, 1);
+      lcd.print("Status: OK");
+    }
+  }
   
-  sendToSupabase(ph, tds, turbidity, temperature, waterLevel);
+  showParams = !showParams;
 }
 
-void sendToSupabase(float ph, int tds, float turbidity, float temp, int waterLevel) {
+void checkCleaningNeeded() {
+  bool cleaningNeeded = false;
+  
+  if (currentPH < PH_LOW_LIMIT || currentPH > PH_HIGH_LIMIT) {
+    cleaningNeeded = true;
+    Serial.println("*** ALERT: pH out of range ***");
+  }
+  if (currentTurbidity > TURBIDITY_LIMIT) {
+    cleaningNeeded = true;
+    Serial.println("*** ALERT: High turbidity ***");
+  }
+  if (currentTDS > TDS_LIMIT) {
+    cleaningNeeded = true;
+    Serial.println("*** ALERT: High TDS ***");
+  }
+
+  // Auto-start cleaning if approved and level is low enough
+  if (cleaningNeeded && userApproved && currentLevel < LEVEL_LIMIT_PERCENT && !cleaningInProgress) {
+    userApproved = false;
+    startCleaning();
+  }
+}
+
+void startCleaning() {
+  cleaningInProgress = true;
+  Serial.println("=== STARTING CLEANING SEQUENCE ===");
+
+  // Turn on UV light
+  digitalWrite(RELAY_UV_LIGHT, HIGH);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Cleaning Tank...");
+
+  // Close inlet, open drain, turn off pump
+  digitalWrite(RELAY_PUMP, LOW);
+  digitalWrite(RELAY_DRAIN_VALVE, LOW);  // Open drain
+  digitalWrite(RELAY_INLET_VALVE, HIGH); // Close inlet
+
+  // Motor stirring sequence
+  digitalWrite(REN, HIGH);
+  digitalWrite(LEN, HIGH);
+
+  // Forward stirring
+  Serial.println("Stirring forward...");
+  lcd.setCursor(0,1);
+  lcd.print("Stirring FWD");
+  analogWrite(RPWM, 180);
+  analogWrite(LPWM, 0);
+  delay(5000);
+
+  // Pause
+  Serial.println("Pause...");
+  analogWrite(RPWM, 0);
+  delay(2000);
+
+  // Reverse stirring
+  Serial.println("Stirring reverse...");
+  lcd.setCursor(0,1);
+  lcd.print("Stirring REV");
+  analogWrite(LPWM, 180);
+  delay(5000);
+
+  // Stop motor
+  analogWrite(LPWM, 0);
+  digitalWrite(REN, LOW);
+  digitalWrite(LEN, LOW);
+
+  // Wait for drain
+  Serial.println("Draining...");
+  lcd.setCursor(0,1);
+  lcd.print("Draining...    ");
+  delay(5000);
+
+  // Start refilling
+  Serial.println("Refilling tank...");
+  digitalWrite(RELAY_PUMP, HIGH);  // Turn on pump
+  delay(5000);
+  digitalWrite(RELAY_DRAIN_VALVE, HIGH);  // Close drain
+  digitalWrite(RELAY_INLET_VALVE, LOW);   // Open inlet
+  digitalWrite(RELAY_PUMP, LOW);          // Turn off pump
+
+  // Monitor refill progress
+  while (true) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    long d = pulseIn(echoPin, HIGH, 30000);
+    float dist = (d * 0.0343) / 2.0;
+    if (dist < DEAD_ZONE_CM) dist = DEAD_ZONE_CM;
+
+    float h = TANK_HEIGHT_CM - (dist - SENSOR_OFFSET_CM);
+    if (h < 0) h = 0;
+    if (h > TANK_HEIGHT_CM) h = TANK_HEIGHT_CM;
+
+    float lvl = (h / TANK_HEIGHT_CM) * 100.0;
+
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("REFILLING...");
+    lcd.setCursor(0,1);
+    lcd.print(lvl,0);
+    lcd.print(" %");
+
+    Serial.print("Refilling: ");
+    Serial.print(lvl);
+    Serial.println("%");
+
+    if (lvl >= 100.0) break;
+    delay(1000);
+  }
+
+  // Cleanup - close valves, turn off UV
+  digitalWrite(RELAY_PUMP, HIGH);
+  digitalWrite(RELAY_INLET_VALVE, HIGH);
+  digitalWrite(RELAY_UV_LIGHT, LOW);
+
+  Serial.println("=== CLEANING COMPLETE ===");
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Cleaning Done!");
+  delay(3000);
+
+  cleaningInProgress = false;
+}
+
+void sendDataToSupabase() {
   if (WiFi.status() != WL_CONNECTED) return;
-  
+
   HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/sensor_readings";
   
+  String url = String(SUPABASE_URL) + "/rest/v1/sensor_readings";
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
   http.addHeader("Prefer", "return=minimal");
-  
+
   StaticJsonDocument<256> doc;
   doc["device_id"] = DEVICE_ID;
-  doc["ph_value"] = ph;
-  doc["tds_value"] = tds;
-  doc["turbidity_value"] = turbidity;
-  doc["temperature"] = temp;
-  doc["water_level_percentage"] = waterLevel;
-  
+  doc["ph"] = currentPH;
+  doc["tds"] = currentTDS;
+  doc["turbidity"] = currentTurbidity;
+  doc["temperature"] = currentTemp;
+  doc["water_level"] = currentLevel;
+
   String jsonString;
   serializeJson(doc, jsonString);
+
+  int httpCode = http.POST(jsonString);
   
-  int httpResponseCode = http.POST(jsonString);
-  
-  if (httpResponseCode > 0) {
-    Serial.printf("Data sent successfully: %d\n", httpResponseCode);
+  if (httpCode > 0) {
+    Serial.print("Supabase POST: ");
+    Serial.println(httpCode);
   } else {
-    Serial.printf("Error sending data: %s\n", http.errorToString(httpResponseCode).c_str());
+    Serial.print("Supabase Error: ");
+    Serial.println(http.errorToString(httpCode));
   }
-  
+
   http.end();
 }
 
-void checkForCommands() {
+void checkSupabaseCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
-  
+
   HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/device_operations?device_id=eq." + 
-               String(DEVICE_ID) + "&status=eq.pending&order=created_at.desc&limit=1";
+  
+  String url = String(SUPABASE_URL) + "/rest/v1/commands?device_id=eq." + 
+               String(DEVICE_ID) + "&executed=eq.false&order=created_at.desc";
   
   http.begin(url);
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
+
+  int httpCode = http.GET();
   
-  int httpResponseCode = http.GET();
-  
-  if (httpResponseCode == 200) {
+  if (httpCode == 200) {
     String payload = http.getString();
     
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, payload);
     
     if (!error && doc.size() > 0) {
-      String command = doc[0]["command"];
-      String value = doc[0]["value"];
-      String operationId = doc[0]["id"];
+      JsonObject cmd = doc[0];
+      String actuator = cmd["actuator"];
+      int value = cmd["value"];
+      String commandId = cmd["id"];
+
+      Serial.print("Command received: ");
+      Serial.print(actuator);
+      Serial.print(" = ");
+      Serial.println(value);
+
+      // Execute command
+      if (actuator == "valve_1") {
+        digitalWrite(RELAY_INLET_VALVE, value ? LOW : HIGH);
+      } else if (actuator == "valve_2") {
+        digitalWrite(RELAY_DRAIN_VALVE, value ? LOW : HIGH);
+      } else if (actuator == "uv_light") {
+        digitalWrite(RELAY_UV_LIGHT, value ? HIGH : LOW);
+      } else if (actuator == "clean") {
+        userApproved = true;
+      }
+
+      // Mark command as executed
+      String updateUrl = String(SUPABASE_URL) + "/rest/v1/commands?id=eq." + commandId;
+      HTTPClient updateHttp;
+      updateHttp.begin(updateUrl);
+      updateHttp.addHeader("Content-Type", "application/json");
+      updateHttp.addHeader("apikey", SUPABASE_ANON_KEY);
+      updateHttp.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
       
-      executeCommand(command, value);
-      markCommandExecuted(operationId);
+      String updateBody = "{\"executed\":true}";
+      updateHttp.PATCH(updateBody);
+      updateHttp.end();
     }
   }
-  
+
   http.end();
-}
-
-void executeCommand(String command, String value) {
-  Serial.printf("Executing command: %s = %s\n", command.c_str(), value.c_str());
-  
-  if (command == "valve_1") {
-    valve1State = (value == "1" || value == "true");
-    digitalWrite(VALVE_1_PIN, valve1State ? HIGH : LOW);
-  } else if (command == "valve_2") {
-    valve2State = (value == "1" || value == "true");
-    digitalWrite(VALVE_2_PIN, valve2State ? HIGH : LOW);
-  } else if (command == "uv_light") {
-    uvLightState = (value == "1" || value == "true");
-    digitalWrite(UV_LIGHT_PIN, uvLightState ? HIGH : LOW);
-  } else if (command == "motor") {
-    motorSpeed = value.toInt();
-    analogWrite(MOTOR_PIN, map(motorSpeed, 0, 100, 0, 255));
-  } else if (command == "emergency_stop") {
-    emergencyStop();
-  }
-}
-
-void markCommandExecuted(String operationId) {
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/device_operations?id=eq." + operationId;
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_ANON_KEY);
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  
-  String payload = "{\"status\":\"executed\",\"executed_at\":\"now()\"}";
-  http.PATCH(payload);
-  http.end();
-}
-
-void handleButtons() {
-  // Button 1: Toggle Valve 1
-  bool button1 = digitalRead(BUTTON_1_PIN);
-  if (button1 == LOW && lastButton1State == HIGH) {
-    if (millis() - lastDebounceTime > DEBOUNCE_DELAY) {
-      valve1State = !valve1State;
-      digitalWrite(VALVE_1_PIN, valve1State ? HIGH : LOW);
-      Serial.printf("Button 1: Valve 1 %s\n", valve1State ? "ON" : "OFF");
-      lastDebounceTime = millis();
-    }
-  }
-  lastButton1State = button1;
-  
-  // Button 2: Toggle Valve 2
-  bool button2 = digitalRead(BUTTON_2_PIN);
-  if (button2 == LOW && lastButton2State == HIGH) {
-    if (millis() - lastDebounceTime > DEBOUNCE_DELAY) {
-      valve2State = !valve2State;
-      digitalWrite(VALVE_2_PIN, valve2State ? HIGH : LOW);
-      Serial.printf("Button 2: Valve 2 %s\n", valve2State ? "ON" : "OFF");
-      lastDebounceTime = millis();
-    }
-  }
-  lastButton2State = button2;
-  
-  // Button 3: Toggle UV Light
-  bool button3 = digitalRead(BUTTON_3_PIN);
-  if (button3 == LOW && lastButton3State == HIGH) {
-    if (millis() - lastDebounceTime > DEBOUNCE_DELAY) {
-      uvLightState = !uvLightState;
-      digitalWrite(UV_LIGHT_PIN, uvLightState ? HIGH : LOW);
-      Serial.printf("Button 3: UV Light %s\n", uvLightState ? "ON" : "OFF");
-      lastDebounceTime = millis();
-    }
-  }
-  lastButton3State = button3;
-  
-  // Button 4: Emergency Stop
-  bool button4 = digitalRead(BUTTON_4_PIN);
-  if (button4 == LOW && lastButton4State == HIGH) {
-    if (millis() - lastDebounceTime > DEBOUNCE_DELAY) {
-      emergencyStop();
-      lastDebounceTime = millis();
-    }
-  }
-  lastButton4State = button4;
-}
-
-void emergencyStop() {
-  Serial.println("EMERGENCY STOP ACTIVATED!");
-  valve1State = false;
-  valve2State = false;
-  uvLightState = false;
-  motorSpeed = 0;
-  
-  digitalWrite(VALVE_1_PIN, LOW);
-  digitalWrite(VALVE_2_PIN, LOW);
-  digitalWrite(UV_LIGHT_PIN, LOW);
-  digitalWrite(MOTOR_PIN, LOW);
 }
